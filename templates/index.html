@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Upload Document for OCR</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <h1>Document OCR Extraction</h1>
+        <p>Upload an image (PNG, JPG, JPEG) or a PDF document.</p>
+
+        <!-- Flash Messages -->
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                <div class="flash-messages">
+                {% for category, message in messages %}
+                    <div class="flash {{ category }}">{{ message }}</div>
+                {% endfor %}
+                </div>
+            {% endif %}
+        {% endwith %}
+
+        <form action="{{ url_for('upload_file') }}" method="post" enctype="multipart/form-data">
+            <div class="form-group">
+                <label for="file">Choose File:</label>
+                <input type="file" name="file" id="file" accept=".png,.jpg,.jpeg,.pdf" required>
+            </div>
+            <button type="submit" class="btn">Upload and Extract</button>
+        </form>
+        <div id="loading" style="display: none;">Processing... Please wait.</div>
+    </div>
+
+    <script>
+        // Simple loading indicator
+        const form = document.querySelector('form');
+        const loadingDiv = document.getElementById('loading');
+        if (form) {
+            form.addEventListener('submit', function() {
+                loadingDiv.style.display = 'block';
+            });
+        }
+    </script>
+</body>
+</html>

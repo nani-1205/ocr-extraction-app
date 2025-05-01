@@ -1,0 +1,8 @@
+# requirements.txt
+Flask>=2.3
+pymongo>=4.0 # Ensure you have the appropriate version for your MongoDB
+python-dotenv>=1.0
+google-generativeai>=0.3
+Pillow>=9.0 # For image handling by Gemini library
+PyMuPDF>=1.23 # For PDF processing (fitz)
+Werkzeug>=2.3 # For secure_filename
