@@ -14,6 +14,7 @@ if os.path.exists(dotenv_path):
 else:
     load_dotenv() # Load from current directory or standard locations
 
+
 API_KEY = os.getenv('GOOGLE_API_KEY')
 
 if not API_KEY:
@@ -52,19 +53,19 @@ Example 1: Emirates ID
 Example 2: Passport (Generic)
 {
   "document_type": "Passport",
-  "issuing_country_code": "XXX", // e.g., ARE, IND, USA
-  "issuing_country_name": "Full Country Name",
-  "passport_no": "Passport Number",
-  "surname": "Surname",
-  "given_names": "Given Names",
-  "nationality": "Nationality",
-  "date_of_birth": "DD MMM YYYY", // Extract format as seen
-  "sex": "M / F / X",
-  "place_of_birth": "City, Country",
-  "date_of_issue": "DD MMM YYYY",
-  "date_of_expiry": "DD MMM YYYY",
-  "authority": "Issuing Authority",
-  "personal_no": "Personal ID Number if present" // e.g., Emirates ID number for UAE passport
+  "issuing_country_code": "XXX", // e.g., ARE, IND, USA, SGP
+  "issuing_country_name": "Full Country Name", // e.g., REPUBLIC OF SINGAPORE
+  "passport_no": "Passport Number", // e.g., K0000000E
+  "surname": "Surname", // e.g., WONG
+  "given_names": "Given Names", // e.g., KARA YUN EN
+  "nationality": "Nationality", // e.g., SINGAPORE CITIZEN
+  "date_of_birth": "DD MMM YYYY", // Extract format as seen, e.g., 03 MAY 1977
+  "sex": "M / F / X", // e.g., F
+  "place_of_birth": "City, Country", // e.g., SINGAPORE
+  "date_of_issue": "DD MMM YYYY", // e.g., 30 OCT 2017
+  "date_of_expiry": "DD MMM YYYY", // e.g., 30 OCT 2022
+  "authority": "Issuing Authority", // e.g., MINISTRY OF HOME AFFAIRS
+  "personal_no": "Personal ID Number if present" // e.g., S7788888H (National ID No)
 }
 
 Example 3: Generic Document / Unable to Classify
@@ -81,10 +82,10 @@ Example 3: Generic Document / Unable to Classify
 Instructions:
 1. Carefully analyze the image content. Prioritize accuracy.
 2. Determine the document type if possible (e.g., "Emirates ID", "Passport", "Invoice", "Receipt", "Unknown"). Use the "document_type" field.
-3. Extract all relevant key-value pairs. Use the field names shown in the examples where applicable (e.g., "id_number", "passport_no", "name", "expiry_date").
+3. Extract all relevant key-value pairs. Use the field names shown in the examples where applicable (e.g., "id_number", "passport_no", "name", "expiry_date"). Use standard field names like 'surname' and 'given_names' for passports if the label is just 'Name'.
 4. If a field from the examples is not present in the document, omit it entirely from the JSON output.
 5. If additional relevant fields are clearly identifiable (e.g., "company", "occupation", "file_number"), include them using descriptive snake_case keys (e.g., "company_name", "job_title").
-6. Format dates as they appear on the document or consistently as YYYY/MM/DD or YYYY-MM-DD if possible.
+6. Format dates as they appear on the document or consistently as YYYY/MM/DD or YYYY-MM-DD if possible. For passports, often DD MMM YYYY is used.
 7. Ensure the output is **ONLY** a single, valid JSON object. Do not include any text, explanations, apologies, or markdown formatting (like ```json ... ```) outside the JSON structure itself.
 8. If the image is completely unreadable, illegible, or not a document, return a JSON object like: {"error": "Could not extract data from image. Image unclear or not a document.", "document_type": "Unclear"}
 """
@@ -99,11 +100,16 @@ generation_config = {
 }
 
 # --- Safety Settings ---
+# Adjusted HARM_CATEGORY_DANGEROUS_CONTENT threshold to be less strict
+# This may be necessary for processing documents like passports/IDs which can
+# sometimes be flagged, but be mindful of Google's AUP.
 safety_settings = [
   {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
   {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
   {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-  {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+  # --- V V V --- ADJUSTED THRESHOLD HERE --- V V V ---
+  {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_ONLY_HIGH"} # Less strict than BLOCK_MEDIUM_AND_ABOVE
+  # --- ^ ^ ^ --- END OF ADJUSTMENT --- ^ ^ ^ ---
 ]
 
 # --- Initialize the Generative Model ---
@@ -174,29 +180,53 @@ def extract_data_with_gemini(image_path):
         response = model.generate_content(prompt_parts)
 
         # --- Response Handling ---
-        # Check if the response was blocked or empty *before* trying to access .text
-        if not response.parts:
-             # Check for safety/policy blocks
-            try:
-                 finish_reason = response.prompt_feedback.block_reason
-                 if finish_reason:
-                      error_message = f"Extraction blocked by API policy. Reason: {finish_reason}"
-                      print(f"Warning: {error_message}")
-                      return {"error": error_message, "document_type": "Blocked"}
-                 else:
-                      # If no block reason, it might be an empty response for other reasons
-                      error_message = "Extraction failed. Received an empty response from the API (no parts)."
-                      print(f"Error: {error_message}")
-                      # Log candidate info if available for debugging
-                      try:
-                           print(f"Candidate info: {response.candidates}")
-                      except Exception: pass
-                      return {"error": error_message, "document_type": "API Error"}
-            except AttributeError:
-                 # If prompt_feedback is missing
-                 error_message = "Extraction failed. Received an empty response with no feedback."
-                 print(f"Error: {error_message}")
-                 return {"error": error_message, "document_type": "API Error"}
+        # Check for safety blocks first using prompt_feedback if available
+        block_reason = None
+        finish_reason_safety = False
+        try:
+            if response.prompt_feedback:
+                block_reason = response.prompt_feedback.block_reason
+                if block_reason:
+                    error_message = f"Extraction blocked by API policy. Reason: {block_reason}"
+                    print(f"Warning: {error_message}")
+                    # Try to get more detail from safety_ratings if block_reason exists
+                    details = " Check safety ratings in logs."
+                    try:
+                         if response.candidates and response.candidates[0].safety_ratings:
+                              ratings_str = ", ".join([f"{r.category.name}={r.probability.name}" for r in response.candidates[0].safety_ratings])
+                              details = f" Details: {ratings_str}"
+                    except Exception: pass # Ignore if details aren't available
+                    return {"error": error_message + details, "document_type": "Blocked"}
+            # Check candidate finish reason too (sometimes block is here)
+            if response.candidates and response.candidates[0].finish_reason.name == 'SAFETY':
+                 finish_reason_safety = True
+
+        except AttributeError:
+            print("Warning: Could not access prompt_feedback or candidates for safety check.")
+            pass # Continue processing, but be aware feedback might be missing
+
+        # Check if the response is empty or blocked by safety (even if prompt_feedback didn't catch it)
+        if not response.parts or finish_reason_safety:
+             error_message = "Extraction failed."
+             if finish_reason_safety:
+                  error_message += " Reason: SAFETY."
+                  # Log candidate info if available for debugging SAFETY blocks
+                  try:
+                       print(f"Candidate info (SAFETY block): {response.candidates}")
+                       # Extract specific rating details if possible
+                       if response.candidates and response.candidates[0].safety_ratings:
+                            ratings_str = ", ".join([f"{r.category.name}={r.probability.name} (Blocked: {r.blocked})" for r in response.candidates[0].safety_ratings])
+                            error_message += f" Details: {ratings_str}"
+                  except Exception as log_err:
+                       print(f"Error logging candidate info: {log_err}")
+             elif not response.parts:
+                  error_message += " Received an empty response from the API (no parts)."
+             else:
+                  # Should not happen if finish_reason_safety is True, but as fallback
+                  error_message += " Unknown reason (empty parts or safety)."
+
+             print(f"Error: {error_message}")
+             return {"error": error_message, "document_type": "API Error/Blocked"}
 
 
         # Access the response text (should be JSON formatted due to mime_type)
@@ -212,10 +242,6 @@ def extract_data_with_gemini(image_path):
                  return {"error": "API response format unexpected (not a JSON object).", "raw_response": response_text}
 
             print("Successfully extracted and parsed JSON data from Gemini.")
-            # Optional: Add basic validation if needed (e.g., check for document_type)
-            # if "document_type" not in extracted_data:
-            #     print("Warning: Extracted data missing 'document_type' field.")
-
             return extracted_data # Success!
 
         except json.JSONDecodeError as json_err:
