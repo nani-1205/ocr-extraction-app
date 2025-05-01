@@ -1,5 +1,5 @@
 # docker-compose.yml
-version: '3.8' # Use a recent version
+version: '3.3' # Use a recent version
 
 services:
   # The Flask Application Service (will run multiple instances)
