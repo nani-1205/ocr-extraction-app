@@ -1,52 +1,60 @@
 # docker-compose.yml
-version: '3.3' # Use a recent version
+# Using version 3.3 for compatibility with older Docker Compose installations
+# Scaling will be handled by the `--scale` flag in the `docker-compose up` command.
+version: '3.3'
 
 services:
-  # The Flask Application Service (will run multiple instances)
+  # The Flask Application Service
+  # Compose will automatically create unique container names for scaled instances
+  # e.g., projectname_app_1, projectname_app_2, etc.
   app:
     build:
-      context: .          # Use the current directory as the build context
+      context: .          # Directory containing Dockerfile.app and application code
       dockerfile: Dockerfile.app # Specify the Dockerfile for the app
-    # image: your-dockerhub-username/ocr-app:latest # Optionally push/pull from a registry
-    # restart: unless-stopped # Restart policy
-    container_name: ocr_app_instance # Base name, compose adds number suffix
+    # Optionally specify image name for registry push/pull:
+    # image: your-dockerhub-username/ocr-app:latest
+    # restart: unless-stopped # Optional: Restart policy for the containers
     env_file:
-      - .env            # Load environment variables from .env file
+      - .env            # Load environment variables from the .env file
+    # Volumes (optional, only if needed for persistence beyond container life)
     # volumes:
-      # - ./uploads:/app/uploads # Persist uploads if needed across restarts (usually not for temp files)
+      # - ./uploads:/app/uploads # Example: Persist the uploads directory (usually not needed for temp files)
     networks:
-      - ocr_network     # Connect to the custom network
+      - ocr_network     # Connect this service to the custom network
 
-    # !! IMPORTANT FOR MONGODB ACCESS !!
+    # IMPORTANT FOR MONGODB ACCESS:
     # Ensure MONGO_HOST in your .env file is reachable from the Docker container.
-    # - If MongoDB is running on your HOST machine (Docker Desktop): Use host.docker.internal
-    #   MONGO_HOST="host.docker.internal"
-    # - If MongoDB is running on your HOST machine (Linux): Find your Docker bridge IP (e.g., `ip addr show docker0`) and use that.
-    #   MONGO_HOST="172.17.0.1" # Example, check your actual IP
-    # - If MongoDB is ALSO a Docker container in this compose file: Use the MongoDB service name.
-    #   MONGO_HOST="mongodb_service_name"
-    # - If MongoDB is external (like your 18.60.111.115): Ensure containers have network access to it.
-    #   MONGO_HOST="18.60.111.115" # (As you have it)
+    # - If MongoDB runs on your HOST machine (Docker Desktop): Use "host.docker.internal"
+    #   Example .env: MONGO_HOST="host.docker.internal"
+    # - If MongoDB runs on your HOST machine (Linux): Use the Docker bridge IP (e.g., 172.17.0.1)
+    #   Example .env: MONGO_HOST="172.17.0.1" (Find yours via `ip addr show docker0`)
+    # - If MongoDB is ALSO a Docker container in this compose file (not shown here): Use its service name.
+    #   Example .env: MONGO_HOST="mongodb_service_name"
+    # - If MongoDB is external (like your 18.60.111.115): Use the external IP.
+    #   Example .env: MONGO_HOST="18.60.111.115" (Ensure container network allows access)
 
-    deploy:
-      replicas: 3       # <-- Run 3 instances of the Flask app
+    # NOTE: The 'deploy' key with 'replicas' is removed as it's not supported
+    # by Compose file version 3.3. Use `--scale app=N` on the command line.
 
   # The Nginx Load Balancer Service
+  # Acts as the single entry point and distributes requests to 'app' instances.
   nginx:
-    image: nginx:1.25-alpine # Use official Nginx image
-    container_name: ocr_nginx_lb
-    # restart: unless-stopped
+    image: nginx:1.25-alpine # Use a specific, stable version of the official Nginx image
+    container_name: ocr_nginx_lb # Custom name is okay for this single instance service
+    # restart: unless-stopped # Optional: Restart policy
     ports:
-      - "5000:80"       # Map Host Port 5000 to Nginx Container Port 80
-                        # Access the app via http://<your-host-ip>:5000
+      - "5000:80"       # Map HOST Port 5000 -> Nginx Container Port 80
+                        # Access the clustered app via http://<your-host-ip>:5000
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro # Mount custom config (read-only)
+      # Mount the custom Nginx configuration file into the container (read-only)
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
     networks:
-      - ocr_network
+      - ocr_network     # Connect Nginx to the same network as the app services
     depends_on:
-      - app             # Wait for the 'app' service to be started (doesn't guarantee readiness)
+      - app             # Ensures 'app' service(s) are started before Nginx
+                        # Note: Doesn't guarantee app readiness, only startup order.
 
-# Define the custom network
+# Define the custom network for services to communicate
 networks:
   ocr_network:
-    driver: bridge      # Use the default bridge driver
+    driver: bridge      # Use the standard bridge network driver
