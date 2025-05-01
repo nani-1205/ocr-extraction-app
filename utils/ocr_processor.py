@@ -1,44 +1,52 @@
 # utils/ocr_processor.py
 import os
 import google.generativeai as genai
+from google.api_core import exceptions as google_api_exceptions # For specific API error handling
 from PIL import Image
 import json
 from dotenv import load_dotenv
 
-load_dotenv()
+# --- Load Environment Variables ---
+# Load from .env file in the parent directory or current directory
+dotenv_path = os.path.join(os.path.dirname(__file__), '..', '.env')
+if os.path.exists(dotenv_path):
+    load_dotenv(dotenv_path=dotenv_path)
+else:
+    load_dotenv() # Load from current directory or standard locations
 
 API_KEY = os.getenv('GOOGLE_API_KEY')
 
 if not API_KEY:
-    raise ValueError("GOOGLE_API_KEY environment variable not set!")
+    # Use a more specific error or handle it gracefully depending on application needs
+    raise ValueError("GOOGLE_API_KEY environment variable not set or not found in .env file!")
 
 genai.configure(api_key=API_KEY)
 
-# --- IMPORTANT: The Prompt ---
+# --- Prompt for Structured Data Extraction ---
 # This prompt guides Gemini to extract structured data.
 # It includes examples for common document types.
-# You might need to refine this prompt based on the specific documents you encounter.
+# Refine this prompt based on the specific documents and required output structure.
 EXTRACTION_PROMPT = """
-Analyze the provided image, which is a picture of a document (like an ID card, passport, etc.).
+Analyze the provided image, which is a picture of a document (like an ID card, passport, invoice, receipt, etc.).
 Identify the key information fields present in the document and extract their values.
-Return the extracted information strictly as a JSON object.
+Return the extracted information strictly as a JSON object that adheres to the requested format.
 
-Here are examples of expected JSON structures for common document types:
+Here are examples of potential JSON structures for common document types:
 
 Example 1: Emirates ID
 {
   "document_type": "Emirates ID",
   "country": "UNITED ARAB EMIRATES",
-  "residence_type": "RESIDENCE / IDENTITY CARD", // Extract the exact text
-  "residence_status": "RESIDENT / Specific Status if mentioned", // Extract status if present, otherwise null or omit
+  "residence_type": "RESIDENCE / IDENTITY CARD", // Extract the exact text for type
+  "residence_status": "RESIDENT", // Extract status if present, otherwise null
   "id_number": "784-xxxx-xxxxxxx-x",
-  "name": "Full Name",
-  "nationality": "Nationality", // Add if visible
-  "date_of_birth": "YYYY/MM/DD", // Add if visible
+  "name": "Full Name As Printed",
+  "nationality": "Nationality",
+  "date_of_birth": "YYYY/MM/DD", // Or format as seen if different
   "expiry_date": "YYYY/MM/DD",
-  "signature_holder": "Yes / No / Cannot Determine", // Add if visible
-  "card_number": "Card number if visible on back or front", // Add if visible
-  "place_of_issue": "Place if mentioned" // Add if visible
+  "signature_holder": "Yes / No / Cannot Determine",
+  "card_number": "Card number if visible", // e.g., from back side
+  "place_of_issue": "Place if mentioned" // e.g., DUBAI
 }
 
 Example 2: Passport (Generic)
@@ -50,43 +58,47 @@ Example 2: Passport (Generic)
   "surname": "Surname",
   "given_names": "Given Names",
   "nationality": "Nationality",
-  "date_of_birth": "DD MMM YYYY / YYYY-MM-DD", // Extract format as seen
+  "date_of_birth": "DD MMM YYYY", // Extract format as seen
   "sex": "M / F / X",
   "place_of_birth": "City, Country",
-  "date_of_issue": "DD MMM YYYY / YYYY-MM-DD",
-  "date_of_expiry": "DD MMM YYYY / YYYY-MM-DD",
+  "date_of_issue": "DD MMM YYYY",
+  "date_of_expiry": "DD MMM YYYY",
   "authority": "Issuing Authority",
-  "personal_no": "Personal ID Number if present" // e.g., Emirates ID number on UAE passport
+  "personal_no": "Personal ID Number if present" // e.g., Emirates ID number for UAE passport
 }
 
 Example 3: Generic Document / Unable to Classify
 {
-  "document_type": "Unknown / Other",
+  "document_type": "Unknown / Other / Specific Type (e.g., Invoice)",
   "extracted_fields": {
     "field_name_1": "value_1",
     "field_name_2": "value_2"
     // Add any key-value pairs found
   },
-  "raw_text": "Full OCR text if structured extraction fails" // Optional fallback
+  "raw_text": "Full OCR text if structured extraction fails significantly" // Optional fallback
 }
 
 Instructions:
-1. Analyze the image content carefully.
-2. Determine the document type if possible (e.g., "Emirates ID", "Passport", "Invoice", "Receipt", "Unknown").
-3. Extract all relevant key-value pairs. Use the field names shown in the examples where applicable. If a field from the examples isn't present, omit it. If additional relevant fields are found, include them.
-4. Format dates as they appear or in YYYY/MM/DD or YYYY-MM-DD format if possible.
-5. Ensure the output is **ONLY** a valid JSON object, enclosed in ```json ... ``` if necessary, but ideally just the raw JSON. Do not include any other text, explanations, or markdown formatting outside the JSON structure itself.
-6. If the image is unclear or extraction is not possible, return a JSON object like: {"error": "Could not extract data from image.", "document_type": "Unclear"}
+1. Carefully analyze the image content. Prioritize accuracy.
+2. Determine the document type if possible (e.g., "Emirates ID", "Passport", "Invoice", "Receipt", "Unknown"). Use the "document_type" field.
+3. Extract all relevant key-value pairs. Use the field names shown in the examples where applicable (e.g., "id_number", "passport_no", "name", "expiry_date").
+4. If a field from the examples is not present in the document, omit it entirely from the JSON output.
+5. If additional relevant fields are clearly identifiable (e.g., "company", "occupation", "file_number"), include them using descriptive snake_case keys (e.g., "company_name", "job_title").
+6. Format dates as they appear on the document or consistently as YYYY/MM/DD or YYYY-MM-DD if possible.
+7. Ensure the output is **ONLY** a single, valid JSON object. Do not include any text, explanations, apologies, or markdown formatting (like ```json ... ```) outside the JSON structure itself.
+8. If the image is completely unreadable, illegible, or not a document, return a JSON object like: {"error": "Could not extract data from image. Image unclear or not a document.", "document_type": "Unclear"}
 """
 
-# Set up the model
+# --- Model Configuration ---
 generation_config = {
-  "temperature": 0.2, # Lower temperature for more deterministic output
-  "top_p": 1,
-  "top_k": 32,
-  "max_output_tokens": 4096, # Adjust as needed
+  "temperature": 0.2, # Lower temperature for more factual, less creative output
+  "top_p": 0.95,
+  "top_k": 40,        # Adjusted Top K
+  "max_output_tokens": 8192, # Increased token limit for potentially complex documents with Gemini 1.5
+  "response_mime_type": "application/json", # Request JSON output directly
 }
 
+# --- Safety Settings ---
 safety_settings = [
   {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
   {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
@@ -94,90 +106,188 @@ safety_settings = [
   {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
 ]
 
-# Use gemini-pro-vision model
-model = genai.GenerativeModel(model_name="gemini-pro-vision",
-                              generation_config=generation_config,
-                              safety_settings=safety_settings)
+# --- Initialize the Generative Model ---
+# Use the recommended replacement model (gemini-1.5-flash or gemini-1.5-pro)
+# Using "-latest" points to the most recent stable version.
+MODEL_NAME = "gemini-1.5-flash-latest" # Or "gemini-1.5-pro-latest" for potentially higher quality but slower/more expensive
+try:
+    model = genai.GenerativeModel(model_name=MODEL_NAME,
+                                  generation_config=generation_config,
+                                  safety_settings=safety_settings)
+    print(f"Initialized Generative AI Model: {MODEL_NAME}")
+except Exception as model_init_err:
+     print(f"FATAL: Failed to initialize Generative AI Model ({MODEL_NAME}): {model_init_err}")
+     # Depending on application structure, you might want to raise this error
+     # or handle it in a way that prevents the app from starting without the model.
+     model = None # Ensure model is None if initialization fails
 
+
+# --- Main Extraction Function ---
 def extract_data_with_gemini(image_path):
     """
-    Uses Gemini Pro Vision to extract structured data from an image.
+    Uses the configured Gemini model to extract structured data from an image file.
 
     Args:
-        image_path (str): Path to the image file.
+        image_path (str): Path to the image file (e.g., JPG, PNG).
 
     Returns:
-        dict: A dictionary containing the extracted data or an error message.
-              Returns None if a critical error occurs during processing.
+        dict: A dictionary containing the extracted data, or a dictionary with an 'error' key
+              if extraction fails or an error occurs.
     """
-    print(f"Processing image: {image_path} with Gemini Pro Vision...")
+    if model is None:
+         print("Error: Generative AI model was not initialized successfully.")
+         return {"error": "AI model not available."}
+
+    print(f"Processing image: {os.path.basename(image_path)} with Gemini {model.model_name}...")
     try:
         img = Image.open(image_path)
+        # Ensure image is in RGB format, as many models prefer it.
+        # Handle potential transparency (alpha channel) in PNGs etc.
+        if img.mode == 'RGBA' or img.mode == 'P': # P is palette mode
+             img = img.convert('RGB')
+        elif img.mode != 'RGB':
+            # Attempt conversion for other modes if necessary, log a warning if unusual
+            print(f"Warning: Image mode is {img.mode}. Attempting conversion to RGB.")
+            try:
+                 img = img.convert('RGB')
+            except Exception as convert_err:
+                 print(f"Error: Failed to convert image {os.path.basename(image_path)} to RGB: {convert_err}")
+                 return {"error": f"Failed to convert image to suitable format: {os.path.basename(image_path)}"}
+
     except FileNotFoundError:
         print(f"Error: Image file not found at {image_path}")
         return {"error": f"Image file not found: {os.path.basename(image_path)}"}
     except Exception as e:
-        print(f"Error opening image {image_path}: {e}")
-        return {"error": f"Failed to open image: {os.path.basename(image_path)}"}
+        # Catch other image opening/processing errors (e.g., corrupted file)
+        print(f"Error opening or preparing image {os.path.basename(image_path)}: {e}")
+        return {"error": f"Failed to open/prepare image: {os.path.basename(image_path)} - {e}"}
 
     # Prepare the prompt parts for the API call
+    # The order can sometimes matter: instructions first, then the image.
     prompt_parts = [
         EXTRACTION_PROMPT, # The detailed instructions and examples
-        img,             # The image object itself
+        img,               # The PIL Image object
     ]
 
     try:
-        # Make the API call
+        # Make the API call to generate content
         response = model.generate_content(prompt_parts)
 
-        # --- Response Parsing ---
+        # --- Response Handling ---
+        # Check if the response was blocked or empty *before* trying to access .text
         if not response.parts:
-             # Check if the response was blocked due to safety settings or other reasons
+             # Check for safety/policy blocks
             try:
-                 # Attempt to access prompt_feedback for block reason
-                 block_reason = response.prompt_feedback.block_reason
-                 error_message = f"Extraction blocked by safety settings or API policy. Reason: {block_reason}"
-                 print(f"Warning: {error_message}")
-                 return {"error": error_message, "document_type": "Blocked"}
-            except Exception:
-                 # If prompt_feedback is not available or doesn't have block_reason
-                 error_message = "Extraction failed. Received an empty response from the API."
+                 finish_reason = response.prompt_feedback.block_reason
+                 if finish_reason:
+                      error_message = f"Extraction blocked by API policy. Reason: {finish_reason}"
+                      print(f"Warning: {error_message}")
+                      return {"error": error_message, "document_type": "Blocked"}
+                 else:
+                      # If no block reason, it might be an empty response for other reasons
+                      error_message = "Extraction failed. Received an empty response from the API (no parts)."
+                      print(f"Error: {error_message}")
+                      # Log candidate info if available for debugging
+                      try:
+                           print(f"Candidate info: {response.candidates}")
+                      except Exception: pass
+                      return {"error": error_message, "document_type": "API Error"}
+            except AttributeError:
+                 # If prompt_feedback is missing
+                 error_message = "Extraction failed. Received an empty response with no feedback."
                  print(f"Error: {error_message}")
                  return {"error": error_message, "document_type": "API Error"}
 
 
+        # Access the response text (should be JSON formatted due to mime_type)
         response_text = response.text
+        # print(f"Raw Gemini Response Text:\n{response_text}") # Uncomment for deep debugging
 
-        # Clean the response text - Gemini might sometimes wrap JSON in markdown backticks
-        cleaned_response = response_text.strip()
-        if cleaned_response.startswith("```json"):
-            cleaned_response = cleaned_response[7:]
-        if cleaned_response.endswith("```"):
-            cleaned_response = cleaned_response[:-3]
-        cleaned_response = cleaned_response.strip()
-
-        # Attempt to parse the cleaned text as JSON
+        # Attempt to parse the response text as JSON
         try:
-            extracted_data = json.loads(cleaned_response)
+            extracted_data = json.loads(response_text)
             if not isinstance(extracted_data, dict):
-                 print(f"Warning: Gemini response parsed but is not a dictionary: {type(extracted_data)}")
-                 return {"error": "API response format unexpected (not a JSON object).", "raw_response": cleaned_response}
+                 # Model returned valid JSON, but not a JSON object (e.g., a list or string)
+                 print(f"Warning: Gemini response parsed but is not a JSON object (dictionary): {type(extracted_data)}")
+                 return {"error": "API response format unexpected (not a JSON object).", "raw_response": response_text}
 
-            print("Successfully extracted data.")
-            # print(f"Extracted Data: {json.dumps(extracted_data, indent=2)}") # DEBUG
-            return extracted_data
+            print("Successfully extracted and parsed JSON data from Gemini.")
+            # Optional: Add basic validation if needed (e.g., check for document_type)
+            # if "document_type" not in extracted_data:
+            #     print("Warning: Extracted data missing 'document_type' field.")
+
+            return extracted_data # Success!
 
         except json.JSONDecodeError as json_err:
+            # The model failed to return valid JSON despite the mime_type request
             print(f"Error: Failed to decode JSON response from Gemini: {json_err}")
-            print(f"Raw Gemini Response Text:\n{response_text}") # Log the raw response for debugging
+            print(f"Raw Gemini Response Text was:\n{response_text}") # Log the problematic text
+            # Provide a structured error, including the raw response for debugging
             return {"error": "Failed to parse API response as JSON.", "raw_response": response_text}
+        except Exception as parse_err:
+             # Catch other potential errors during parsing
+             print(f"An unexpected error occurred during response parsing: {parse_err}")
+             return {"error": f"Unexpected response parsing error: {parse_err}", "raw_response": response_text}
 
+
+    # --- Exception Handling for API Call ---
     except genai.types.generation_types.BlockedPromptException as bpe:
-         error_message = f"Extraction blocked by safety settings or API policy. Reason: {bpe}"
+         # Specific exception for blocked prompts (might be less common now with feedback checks)
+         error_message = f"Extraction blocked by API policy (BlockedPromptException). Reason: {bpe}"
          print(f"Warning: {error_message}")
          return {"error": error_message, "document_type": "Blocked"}
+
+    except google_api_exceptions.GoogleAPIError as api_err:
+         # Handle specific Google API errors (e.g., 4xx, 5xx status codes)
+         print(f"A Google API error occurred during the Gemini call: {api_err}")
+         # Try to get status code and message for better context
+         error_details = f"Status Code: {api_err.code} - Message: {api_err.message}" if hasattr(api_err, 'code') and hasattr(api_err, 'message') else str(api_err)
+         # Specific check for common issues like invalid API key or quota exceeded
+         error_code = getattr(api_err, 'code', None)
+         if error_code == 400: # Bad Request (often invalid API key format or model issues)
+              error_details += " (Check API Key, Model Name, Request Format)"
+         elif error_code == 403: # Forbidden (Permissions, API not enabled?)
+              error_details += " (Check API Key Permissions / Billing / API Enabled status)"
+         elif error_code == 429: # Resource Exhausted (Quota)
+              error_details += " (Rate limit or quota exceeded)"
+         elif error_code == 404: # Not Found (Model name typo? Endpoint issue?)
+              error_details += f" (Model '{MODEL_NAME}' might be invalid or unavailable in region)"
+
+         return {"error": f"Google API Error: {error_details}"}
+
     except Exception as e:
-        # Catch other potential API errors (network issues, invalid key etc.)
-        print(f"An error occurred during the Gemini API call: {e}")
-        # You might want to check for specific exception types from the google-generativeai library
-        return {"error": f"An unexpected error occurred during AI processing: {e}"}
+        # Catch other potential runtime errors (network issues, library bugs etc.)
+        error_type = type(e).__name__
+        print(f"An unexpected error occurred during the Gemini API call: {error_type} - {e}")
+        return {"error": f"An unexpected error occurred during AI processing: {error_type} - {e}"}
+
+# --- Optional: Example Usage (for testing the module directly) ---
+if __name__ == '__main__':
+    # This block runs only when the script is executed directly (e.g., python utils/ocr_processor.py)
+    print("\n--- Testing OCR Processor ---")
+    # Create a dummy image file path for testing (replace with a real path)
+    # Make sure you have a test image (e.g., 'test_image.jpg') in the same directory or provide the full path
+    test_image_path = 'test_image.jpg' # <--- PUT A REAL IMAGE PATH HERE FOR TESTING
+
+    if os.path.exists(test_image_path):
+        print(f"Attempting extraction from: {test_image_path}")
+        extracted_info = extract_data_with_gemini(test_image_path)
+
+        print("\n--- Extraction Result ---")
+        if extracted_info:
+            # Pretty print the JSON result
+            print(json.dumps(extracted_info, indent=2))
+        else:
+            # This case should ideally not happen if extract_data_with_gemini always returns a dict
+            print("Extraction function returned None or empty value.")
+
+        if extracted_info and 'error' in extracted_info:
+            print(f"\nExtraction failed with error: {extracted_info['error']}")
+            if 'raw_response' in extracted_info:
+                 print("\n--- Raw Response (if available) ---")
+                 print(extracted_info['raw_response'])
+    else:
+        print(f"Test image not found at: {test_image_path}")
+        print("Please place a test image (e.g., 'test_image.jpg') in the script's directory or update the path.")
+
+    print("\n--- OCR Processor Test Complete ---")
