@@ -6,9 +6,15 @@ from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 import datetime
 import time
+import traceback # For printing full tracebacks
 
 # Import utility functions
-from utils.db_handler import insert_record, get_record_by_id, connection_error as db_connection_error
+# Ensure db_handler connection check happens before using its functions
+from utils import db_handler
+# Access connection error if needed after module load
+db_connection_error = db_handler.connection_error
+
+# Now import other utils that might depend on successful initial setup
 from utils.ocr_processor import extract_data_with_gemini
 from utils.file_converter import convert_pdf_to_image, is_image_file, is_pdf_file
 
@@ -16,53 +22,70 @@ from utils.file_converter import convert_pdf_to_image, is_image_file, is_pdf_fil
 load_dotenv()
 
 # --- Configuration ---
-UPLOAD_FOLDER = 'uploads'
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'pdf'} # Added pdf
+UPLOAD_FOLDER = os.getenv('UPLOAD_FOLDER', 'uploads') # Allow overriding via .env
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'pdf'} # Allowed file types
 MAX_CONTENT_LENGTH = 16 * 1024 * 1024 # 16 MB limit
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
-app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'a_very_secret_key_for_dev') # Use env var for production
+# Use environment variable for FLASK_SECRET_KEY in production for security
+app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'a_very_secret_key_for_dev_only')
 
 # Ensure upload folder exists
 if not os.path.exists(UPLOAD_FOLDER):
-    os.makedirs(UPLOAD_FOLDER)
+    try:
+        os.makedirs(UPLOAD_FOLDER)
+        print(f"Created upload folder: {UPLOAD_FOLDER}")
+    except OSError as e:
+        print(f"Error creating upload folder {UPLOAD_FOLDER}: {e}")
+        # Depending on severity, you might want to exit or handle this differently
+        # For now, we'll let it continue, but uploads will likely fail.
+
 
 # --- Helper Functions ---
 def allowed_file(filename):
+    """Checks if the file extension is allowed."""
     return '.' in filename and \
            filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 # --- Routes ---
 @app.route('/', methods=['GET'])
 def index():
+    """Renders the main upload page."""
     # Check DB connection status on loading the main page
-    if db_connection_error:
-         flash(f"Warning: Database connection issue - {db_connection_error}", 'error')
+    # Re-check connection status from the handler module variable
+    current_db_error = db_handler.connection_error
+    if current_db_error:
+         flash(f"Warning: Database connection issue - {current_db_error}", 'error')
     else:
+         # You might want to attempt a quick ping here for real-time status
+         # but relying on the initial check/last known status is often sufficient
          flash("Database connection appears okay.", 'info') # Optional success message
 
     return render_template('index.html')
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
+    """Handles file uploads, processing, and data storage."""
+
+    # --- 1. File Validation ---
     if 'file' not in request.files:
         flash('No file part in the request.', 'error')
-        return redirect(url_for('index'))
+        return redirect(request.url) # Redirect back to the same page (index)
 
     file = request.files['file']
 
     if file.filename == '':
         flash('No file selected.', 'error')
-        return redirect(url_for('index'))
+        return redirect(request.url)
 
     if not allowed_file(file.filename):
         flash(f"File type not allowed. Please upload {', '.join(ALLOWED_EXTENSIONS)}.", 'error')
-        return redirect(url_for('index'))
+        return redirect(request.url)
 
     original_filename = secure_filename(file.filename)
-    # Create a unique filename to avoid conflicts
+    # Create a unique filename to avoid conflicts and potential security issues
     unique_id = uuid.uuid4().hex
     file_ext = original_filename.rsplit('.', 1)[1].lower()
     temp_filename = f"{unique_id}.{file_ext}"
@@ -73,78 +96,127 @@ def upload_file():
     generated_image_path = None # Keep track if we create a temp image from PDF
 
     try:
+        # --- 2. Save Uploaded File Temporarily ---
         file.save(temp_filepath)
         print(f"File temporarily saved to: {temp_filepath}")
 
-        # --- File Preprocessing ---
+        # --- 3. File Preprocessing (PDF to Image) ---
         if is_image_file(temp_filename):
             image_to_process_path = temp_filepath
             print("Processing as image file.")
         elif is_pdf_file(temp_filename):
             print("Processing as PDF file. Attempting conversion to image...")
-            # Convert PDF to image (saves as PNG in uploads folder)
+            # Convert PDF's first page to an image (saves as PNG in uploads folder)
             generated_image_path = convert_pdf_to_image(temp_filepath, app.config['UPLOAD_FOLDER'])
             if generated_image_path:
                 image_to_process_path = generated_image_path
                 print(f"PDF converted to image: {generated_image_path}")
             else:
                 flash('Failed to convert PDF to image for processing.', 'error')
-                # No need to redirect here, finally block will clean up temp_filepath
+                # Render report page with error, finally block will clean up temp_filepath
+                # No need to redirect immediately
                 return render_template('report.html', error='Failed to convert PDF to image.')
-        # Add elif for DOCX here if implemented later
         else:
-             # Should not happen due to allowed_file check, but good practice
-             flash('Unsupported file type after save.', 'error')
+             # This case should not be reached due to allowed_file check, but as a safeguard:
+             flash('Unsupported file type after save (internal error).', 'error')
              return redirect(url_for('index'))
 
 
-        # --- OCR Processing ---
+        # --- 4. OCR Processing (if image available) ---
         if image_to_process_path:
+            print(f"Starting OCR processing for: {image_to_process_path}")
             start_time = time.time()
+            # Call Gemini AI for extraction
             extracted_data = extract_data_with_gemini(image_to_process_path)
             end_time = time.time()
-            print(f"Gemini processing took {end_time - start_time:.2f} seconds.")
+            processing_duration = round(end_time - start_time, 2)
+            print(f"Gemini processing took {processing_duration:.2f} seconds.")
 
+            # --- 5. Handle OCR Results ---
             if extracted_data and 'error' not in extracted_data:
+                # Successful extraction from Gemini
+
                 # Add metadata before saving to DB
                 extracted_data['_metadata'] = {
                     'original_filename': original_filename,
-                    'upload_timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
-                    'processing_time_seconds': round(end_time - start_time, 2),
-                    'processed_file': os.path.basename(image_to_process_path) # Image used for OCR
+                    'upload_timestamp': datetime.datetime.utcnow().isoformat() + 'Z', # ISO 8601 format UTC
+                    'processing_time_seconds': processing_duration,
+                    'processed_file': os.path.basename(image_to_process_path) # The actual image file used by OCR
                 }
 
-                # --- Store in MongoDB ---
-                record_id = insert_record(extracted_data)
+                # --- 6. Store in MongoDB ---
+                print("Attempting to insert extracted data into MongoDB...")
+                # insert_record returns the ObjectId on success, None on failure
+                record_id = db_handler.insert_record(extracted_data)
 
                 if record_id:
+                    # --- SUCCESS PATH ---
                     flash('File processed and data stored successfully!', 'success')
-                    # Pass the whole data structure to the template
-                    return render_template('report.html', data=extracted_data, record_id=str(record_id))
+                    # Convert ObjectId to string for display in template/JSON serialization
+                    str_record_id = str(record_id)
+                    print(f"Successfully inserted. Record ID (str): {str_record_id}")
+
+                    # Ensure data passed to template doesn't contain unserializable types like ObjectId
+                    # The extracted_data itself *shouldn't* have _id yet, but double-check if issues arise
+                    if '_id' in extracted_data:
+                         # This would be unexpected here, before rendering
+                         print(f"Warning: '_id' key (value: {extracted_data['_id']}) found in extracted_data before rendering template! This might cause issues.")
+                         # Optionally remove it if it causes problems: del extracted_data['_id']
+
+                    # Render the report page
+                    try:
+                         return render_template('report.html', data=extracted_data, record_id=str_record_id)
+                    except Exception as render_err:
+                         # Catch errors specifically during template rendering
+                         print(f"ERROR: Exception occurred during render_template: {render_err}")
+                         traceback.print_exc() # Print full traceback for render error
+                         flash('Error occurred while generating the report page. Please check logs.', 'error')
+                         return redirect(url_for('index')) # Redirect on render error
+
                 else:
-                    flash('File processed, but failed to store data in MongoDB.', 'error')
+                    # Handle DB insert failure (record_id is None)
+                    flash('File processed, but failed to store data in MongoDB. Check server logs.', 'error')
                     # Show extracted data even if DB fails, but indicate the storage error
                     return render_template('report.html', data=extracted_data, error='Failed to save to database.')
             else:
-                # Handle errors reported by Gemini
-                error_message = extracted_data.get('error', 'Unknown error during OCR processing.') if extracted_data else 'OCR processing failed unexpectedly.'
+                # Handle errors reported by Gemini or OCR processing failure
+                error_message = "Unknown error during OCR processing."
+                raw_response = None
+                if extracted_data and 'error' in extracted_data:
+                     error_message = extracted_data.get('error')
+                     raw_response = extracted_data.get('raw_response') # Pass raw response if available
+                elif extracted_data is None:
+                     error_message = "OCR processing function returned None."
+
+                print(f"OCR processing failed: {error_message}")
                 flash(f'OCR processing failed: {error_message}', 'error')
-                return render_template('report.html', error=error_message, raw_response=extracted_data.get('raw_response'))
+                return render_template('report.html', error=error_message, raw_response=raw_response)
         else:
              # This case might occur if PDF conversion failed and returned None
+             print("Error: No processable image was available after preprocessing.")
              flash('Could not obtain a processable image from the uploaded file.', 'error')
+             # Render report page with specific error
              return render_template('report.html', error='Could not obtain a processable image.')
 
-
+    # --- 7. Global Exception Handling ---
     except Exception as e:
-        print(f"An unexpected error occurred during upload/processing: {e}")
-        flash(f'An unexpected error occurred: {e}', 'error')
-        # Redirect to index on unexpected errors, as report page might not have context
+        # Catch any unexpected errors during the entire process
+        error_type = type(e).__name__
+        error_msg = str(e)
+        # Log the detailed error and traceback for backend debugging
+        print(f"ERROR: An unexpected error occurred during upload/processing ({error_type}): {error_msg}")
+        traceback.print_exc() # Print the full stack trace to the console/log file
+
+        # Flash a user-friendly, generic, and JSON-serializable message
+        flash(f'An unexpected error occurred ({error_type}). Please check server logs or contact support.', 'error')
+        # Redirect to the index page on major errors
         return redirect(url_for('index'))
 
+    # --- 8. Cleanup ---
     finally:
-        # --- Cleanup Temporary Files ---
+        # This block executes whether the try block succeeded or failed
         print("Cleaning up temporary files...")
+        # Clean up the original temporary uploaded file
         if os.path.exists(temp_filepath):
             try:
                 os.remove(temp_filepath)
@@ -152,7 +224,7 @@ def upload_file():
             except OSError as e:
                 print(f"Error removing temporary file {temp_filepath}: {e}")
 
-        # Remove the generated image ONLY if it's different from the original upload
+        # Clean up the generated image ONLY if it was created and is different from the temp upload
         if generated_image_path and generated_image_path != temp_filepath and os.path.exists(generated_image_path):
             try:
                 os.remove(generated_image_path)
@@ -161,27 +233,39 @@ def upload_file():
                 print(f"Error removing generated image {generated_image_path}: {e}")
 
 
-# Optional: Route to serve uploaded files if needed (e.g., for debugging)
-# Be cautious about serving user-uploaded content directly in production
+# Optional: Route to serve uploaded files (use with caution in production)
+# Useful for debugging if you want to see the exact file processed
 @app.route('/uploads/<filename>')
 def uploaded_file(filename):
-    # Basic security: Only allow access if the file actually exists
-    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-    if not os.path.exists(file_path) or not os.path.isfile(file_path):
+    """Serves files from the upload folder. Use with caution."""
+    # Basic security: Prevent directory traversal
+    safe_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    if not os.path.abspath(safe_path).startswith(os.path.abspath(app.config['UPLOAD_FOLDER'])):
+        return "Forbidden", 403
+    # Check if file exists
+    if not os.path.exists(safe_path) or not os.path.isfile(safe_path):
         return "File not found", 404
-    # Add more security checks if needed (e.g., check against a DB record)
+    # Consider adding more security checks if needed (e.g., check against a DB record)
+    print(f"Serving file: {filename}") # Log access
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
 
+# --- Application Startup ---
 if __name__ == '__main__':
     # Check initial DB connection before starting the server
+    # db_connection_error is set when db_handler module is loaded
     if db_connection_error:
-         print(f"FATAL: Could not connect to MongoDB on startup: {db_connection_error}")
+         print(f"\n{'='*20} WARNING {'='*20}")
+         print(f"Initial MongoDB connection failed: {db_connection_error}")
+         print("The application will run, but database operations will likely fail.")
          print("Please check your .env file and MongoDB server status.")
-         # Exit if DB connection fails on startup (optional, but recommended)
-         # exit(1)
+         print(f"{'='*50}\n")
+         # Consider exiting if DB is critical: exit(1)
     else:
          print("Initial MongoDB connection check successful.")
 
-    # Run the app (use debug=True only for development)
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    # Run the Flask development server
+    # Use debug=True only for development - it enables auto-reloading and the debugger
+    # For production, use a proper WSGI server like Gunicorn or uWSGI
+    print(f"Starting Flask app (Debug mode: {app.debug})...")
+    app.run(debug=os.environ.get('FLASK_DEBUG', 'True').lower() == 'true', host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
