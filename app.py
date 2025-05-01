@@ -146,7 +146,8 @@ def upload_file():
 
                 # --- 6. Store in MongoDB ---
                 print("Attempting to insert extracted data into MongoDB...")
-                # insert_record returns the ObjectId on success, None on failure
+                # CRITICAL NOTE: insert_one MUTATES the original extracted_data dict
+                # by adding the '_id' field (containing an ObjectId) upon success.
                 record_id = db_handler.insert_record(extracted_data)
 
                 if record_id:
@@ -156,15 +157,21 @@ def upload_file():
                     str_record_id = str(record_id)
                     print(f"Successfully inserted. Record ID (str): {str_record_id}")
 
-                    # Ensure data passed to template doesn't contain unserializable types like ObjectId
-                    # The extracted_data itself *shouldn't* have _id yet, but double-check if issues arise
-                    if '_id' in extracted_data:
-                         # This would be unexpected here, before rendering
-                         print(f"Warning: '_id' key (value: {extracted_data['_id']}) found in extracted_data before rendering template! This might cause issues.")
-                         # Optionally remove it if it causes problems: del extracted_data['_id']
+                    # --- FIX: Remove the ObjectId added by insert_one ---
+                    # The `tojson` filter in Jinja2 cannot serialize ObjectId.
+                    # We remove it from the dict before passing it to the template.
+                    removed_id = extracted_data.pop('_id', None) # Use pop with None default
+                    if removed_id:
+                         print(f"DEBUG: Removed '_id' field (value: {removed_id}) from data before rendering.")
+                    else:
+                         # This would be strange if insert succeeded but _id wasn't added
+                         print("WARNING: insert_record succeeded but '_id' was not found in extracted_data after insert.")
 
-                    # Render the report page
+                    # Now extracted_data should be safely JSON serializable for the template
+                    print(f"DEBUG: Rendering report. Record ID (str): {str_record_id}")
+
                     try:
+                         # Pass the modified extracted_data (without _id) to the template
                          return render_template('report.html', data=extracted_data, record_id=str_record_id)
                     except Exception as render_err:
                          # Catch errors specifically during template rendering
@@ -176,7 +183,7 @@ def upload_file():
                 else:
                     # Handle DB insert failure (record_id is None)
                     flash('File processed, but failed to store data in MongoDB. Check server logs.', 'error')
-                    # Show extracted data even if DB fails, but indicate the storage error
+                    # Show extracted data (which won't have _id here) even if DB fails
                     return render_template('report.html', data=extracted_data, error='Failed to save to database.')
             else:
                 # Handle errors reported by Gemini or OCR processing failure
@@ -217,7 +224,7 @@ def upload_file():
         # This block executes whether the try block succeeded or failed
         print("Cleaning up temporary files...")
         # Clean up the original temporary uploaded file
-        if os.path.exists(temp_filepath):
+        if 'temp_filepath' in locals() and os.path.exists(temp_filepath):
             try:
                 os.remove(temp_filepath)
                 print(f"Removed temporary upload: {temp_filepath}")
@@ -225,7 +232,7 @@ def upload_file():
                 print(f"Error removing temporary file {temp_filepath}: {e}")
 
         # Clean up the generated image ONLY if it was created and is different from the temp upload
-        if generated_image_path and generated_image_path != temp_filepath and os.path.exists(generated_image_path):
+        if 'generated_image_path' in locals() and generated_image_path and generated_image_path != temp_filepath and os.path.exists(generated_image_path):
             try:
                 os.remove(generated_image_path)
                 print(f"Removed generated image: {generated_image_path}")
@@ -267,5 +274,7 @@ if __name__ == '__main__':
     # Run the Flask development server
     # Use debug=True only for development - it enables auto-reloading and the debugger
     # For production, use a proper WSGI server like Gunicorn or uWSGI
-    print(f"Starting Flask app (Debug mode: {app.debug})...")
-    app.run(debug=os.environ.get('FLASK_DEBUG', 'True').lower() == 'true', host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    # Read FLASK_DEBUG env var for debug mode control
+    is_debug_mode = os.environ.get('FLASK_DEBUG', 'True').lower() in ['true', '1', 'yes']
+    print(f"Starting Flask app (Debug mode: {is_debug_mode})...")
+    app.run(debug=is_debug_mode, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
