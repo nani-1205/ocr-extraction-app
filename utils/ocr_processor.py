@@ -28,7 +28,7 @@ genai.configure(api_key=API_KEY)
 # It includes examples for common document types.
 # Refine this prompt based on the specific documents and required output structure.
 EXTRACTION_PROMPT = """
-Analyze the provided image, which is a picture of a document (like an ID card, passport, invoice, receipt, etc.).
+Analyze the provided image, which is a picture of a document (like an ID card, passport, invoice, receipt, Aadhaar card, etc.).
 Identify the key information fields present in the document and extract their values.
 Return the extracted information strictly as a JSON object that adheres to the requested format.
 
@@ -68,7 +68,30 @@ Example 2: Passport (Generic)
   "personal_no": "Personal ID Number if present" // e.g., S7788888H (National ID No)
 }
 
-Example 3: Generic Document / Unable to Classify
+Example 3: Aadhaar Card (India)
+{
+  "document_type": "Aadhaar Card",
+  "country": "INDIA",
+  "enrolment_no": "Enrolment Number if visible", // e.g., 2081/30048/19881
+  "aadhaar_no": "xxxx xxxx xxxx", // e.g., 2732 5192 7080
+  "vid": "xxxx xxxx xxxx xxxx", // e.g., 9197 2052 8874 3031
+  "name": "Full Name As Printed", // e.g., Kolli Yashwanth
+  "date_of_birth": "DD/MM/YYYY", // e.g., 03/10/2000
+  "sex": "MALE / FEMALE / OTHER", // e.g., MALE
+  "address": {
+    "care_of": "C/O field if present", // e.g., Ramisetti Nageswara Rao,
+    "house_no_street": "House number / Street", // e.g., 9-74, Ayyappaswami Temple Street, Rajeev Nagar
+    "village_town_city": "VTC", // e.g., Sathupalle
+    "post_office": "PO", // e.g., Sathupalli
+    "sub_district": "Sub District", // e.g., Sathupalle
+    "district": "District", // e.g., Khammam
+    "state": "State", // e.g., Telangana
+    "pin_code": "PIN Code" // e.g., 507303
+  },
+  "mobile": "Mobile number if visible" // e.g., 9121500584
+}
+
+Example 4: Generic Document / Unable to Classify
 {
   "document_type": "Unknown / Other / Specific Type (e.g., Invoice)",
   "extracted_fields": {
@@ -81,11 +104,11 @@ Example 3: Generic Document / Unable to Classify
 
 Instructions:
 1. Carefully analyze the image content. Prioritize accuracy.
-2. Determine the document type if possible (e.g., "Emirates ID", "Passport", "Invoice", "Receipt", "Unknown"). Use the "document_type" field.
-3. Extract all relevant key-value pairs. Use the field names shown in the examples where applicable (e.g., "id_number", "passport_no", "name", "expiry_date"). Use standard field names like 'surname' and 'given_names' for passports if the label is just 'Name'.
+2. Determine the document type if possible (e.g., "Aadhaar Card", "Passport", "Emirates ID", "Invoice", "Unknown"). Use the "document_type" field.
+3. Extract all relevant key-value pairs. Use the field names shown in the examples where applicable (e.g., "aadhaar_no", "passport_no", "name", "expiry_date"). Use standard field names like 'surname' and 'given_names' for passports if the label is just 'Name'. For Aadhaar, use 'name' and nest address details under an 'address' object.
 4. If a field from the examples is not present in the document, omit it entirely from the JSON output.
 5. If additional relevant fields are clearly identifiable (e.g., "company", "occupation", "file_number"), include them using descriptive snake_case keys (e.g., "company_name", "job_title").
-6. Format dates as they appear on the document or consistently as YYYY/MM/DD or YYYY-MM-DD if possible. For passports, often DD MMM YYYY is used.
+6. Format dates as they appear on the document or consistently as YYYY/MM/DD or YYYY-MM-DD if possible. For passports, often DD MMM YYYY is used. For Aadhaar, DD/MM/YYYY is common.
 7. Ensure the output is **ONLY** a single, valid JSON object. Do not include any text, explanations, apologies, or markdown formatting (like ```json ... ```) outside the JSON structure itself.
 8. If the image is completely unreadable, illegible, or not a document, return a JSON object like: {"error": "Could not extract data from image. Image unclear or not a document.", "document_type": "Unclear"}
 """
@@ -100,15 +123,18 @@ generation_config = {
 }
 
 # --- Safety Settings ---
-# Adjusted HARM_CATEGORY_DANGEROUS_CONTENT threshold to be less strict
-# This may be necessary for processing documents like passports/IDs which can
-# sometimes be flagged, but be mindful of Google's AUP.
+# Adjusted HARM_CATEGORY_DANGEROUS_CONTENT threshold to BLOCK_NONE
+# This is NECESSARY for processing some ID documents (like Aadhaar) which
+# are often flagged by AI safety filters due to containing PII.
+# WARNING: Disabling safety filters requires careful consideration of
+# Google's Acceptable Use Policy and applicable data privacy regulations.
+# You are responsible for the responsible handling of potentially sensitive data.
 safety_settings = [
   {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
   {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
   {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-  # --- V V V --- ADJUSTED THRESHOLD HERE --- V V V ---
-  {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_ONLY_HIGH"} # Less strict than BLOCK_MEDIUM_AND_ABOVE
+  # --- V V V --- FINAL ADJUSTMENT FOR ID DOCUMENTS --- V V V ---
+  {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"} # Changed from BLOCK_ONLY_HIGH
   # --- ^ ^ ^ --- END OF ADJUSTMENT --- ^ ^ ^ ---
 ]
 
@@ -183,6 +209,7 @@ def extract_data_with_gemini(image_path):
         # Check for safety blocks first using prompt_feedback if available
         block_reason = None
         finish_reason_safety = False
+        safety_details_log = ""
         try:
             if response.prompt_feedback:
                 block_reason = response.prompt_feedback.block_reason
@@ -194,31 +221,34 @@ def extract_data_with_gemini(image_path):
                     try:
                          if response.candidates and response.candidates[0].safety_ratings:
                               ratings_str = ", ".join([f"{r.category.name}={r.probability.name}" for r in response.candidates[0].safety_ratings])
-                              details = f" Details: {ratings_str}"
+                              safety_details_log = f" Details: {ratings_str}"
+                              details = safety_details_log # Include in user-facing error too
                     except Exception: pass # Ignore if details aren't available
                     return {"error": error_message + details, "document_type": "Blocked"}
             # Check candidate finish reason too (sometimes block is here)
             if response.candidates and response.candidates[0].finish_reason.name == 'SAFETY':
                  finish_reason_safety = True
+                 # Log candidate info if available for debugging SAFETY blocks
+                 try:
+                      print(f"Candidate info (SAFETY block): {response.candidates}")
+                      # Extract specific rating details if possible for logging
+                      if response.candidates and response.candidates[0].safety_ratings:
+                           safety_details_log = " Details: " + ", ".join([f"{r.category.name}={r.probability.name} (Blocked: {r.blocked})" for r in response.candidates[0].safety_ratings])
+                 except Exception as log_err:
+                      print(f"Error logging candidate info: {log_err}")
+
 
         except AttributeError:
             print("Warning: Could not access prompt_feedback or candidates for safety check.")
             pass # Continue processing, but be aware feedback might be missing
 
         # Check if the response is empty or blocked by safety (even if prompt_feedback didn't catch it)
+        # This handles cases where blocking happens even with BLOCK_NONE (rare, but possible for severe violations)
+        # or if the API returns empty for other reasons.
         if not response.parts or finish_reason_safety:
              error_message = "Extraction failed."
              if finish_reason_safety:
-                  error_message += " Reason: SAFETY."
-                  # Log candidate info if available for debugging SAFETY blocks
-                  try:
-                       print(f"Candidate info (SAFETY block): {response.candidates}")
-                       # Extract specific rating details if possible
-                       if response.candidates and response.candidates[0].safety_ratings:
-                            ratings_str = ", ".join([f"{r.category.name}={r.probability.name} (Blocked: {r.blocked})" for r in response.candidates[0].safety_ratings])
-                            error_message += f" Details: {ratings_str}"
-                  except Exception as log_err:
-                       print(f"Error logging candidate info: {log_err}")
+                  error_message += " Reason: SAFETY." + safety_details_log # Add logged details
              elif not response.parts:
                   error_message += " Received an empty response from the API (no parts)."
              else:
