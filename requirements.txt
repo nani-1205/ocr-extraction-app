@@ -10,4 +10,5 @@ PyMuPDF>=1.23 # fitz
 Werkzeug>=2.3 # Still used for secure_filename
 gunicorn>=20.1 # Process manager for Uvicorn workers
 pydantic>=1.10 # Data validation (dependency of FastAPI)
-# Removed: Flask
+# Removed: Flask        # Flask is not needed as FastAPI is used
+# Removed: Flask-Cors   # CORS is handled by FastAPI            
