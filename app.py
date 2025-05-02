@@ -1,66 +1,91 @@
-# app.py
+# app.py (FastAPI Version)
 import os
 import uuid
-from flask import Flask, request, render_template, redirect, url_for, flash, send_from_directory, jsonify # Added jsonify
-from werkzeug.utils import secure_filename
+import shutil # For saving UploadFile efficiently
+from fastapi import FastAPI, File, UploadFile, Header, HTTPException, Depends, Request
+from fastapi.responses import JSONResponse
+from werkzeug.utils import secure_filename # Still useful for filenames
 from dotenv import load_dotenv
 import datetime
 import time
-import traceback # For printing full tracebacks
+import traceback
+from typing import Optional, Dict, Any # For type hinting
 
 # Load environment variables FIRST
 load_dotenv()
 
 # Import utility functions AFTER loading env vars
 from utils import db_handler
-db_connection_error = db_handler.connection_error
+# db_connection_error = db_handler.connection_error # Check status if needed at startup
 from utils.ocr_processor import extract_data_with_gemini
 from utils.file_converter import convert_pdf_to_image, is_image_file, is_pdf_file
 
-
 # --- Configuration ---
-UPLOAD_FOLDER = os.getenv('UPLOAD_FOLDER', 'uploads') # Allow overriding via .env
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'pdf'} # Allowed file types
-MAX_CONTENT_LENGTH = 16 * 1024 * 1024 # 16 MB limit
-# Load API key from environment (used for authentication)
-API_SECRET_KEY = os.getenv('API_SECRET_KEY')
+UPLOAD_FOLDER = os.getenv('UPLOAD_FOLDER', 'uploads')
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'pdf'}
+API_SECRET_KEY = os.getenv('API_SECRET_KEY') # Load the API key
 
-app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
-# Use environment variable for FLASK_SECRET_KEY in production for security
-app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'a_very_secret_key_for_dev_only')
+# --- FastAPI App Instance ---
+# Add metadata for OpenAPI docs
+app = FastAPI(
+    title="OCR Extraction API",
+    description="Uploads document files (Image or PDF) and extracts structured data using Google Gemini Vision.",
+    version="1.1.0", # Example version
+    contact={
+        "name": "API Support",
+        "url": "http://example.com/support", # Replace with actual URL if available
+        "email": "support@example.com",    # Replace with actual email
+    },
+    license_info={
+        "name": "Apache 2.0", # Or your chosen license
+        "url": "https://www.apache.org/licenses/LICENSE-2.0.html",
+    },
+)
 
-# Ensure upload folder exists
-if not os.path.exists(UPLOAD_FOLDER):
-    try:
-        os.makedirs(UPLOAD_FOLDER)
-        print(f"Created upload folder: {UPLOAD_FOLDER}")
-    except OSError as e:
-        print(f"Error creating upload folder {UPLOAD_FOLDER}: {e}")
-        # Consider handling this more gracefully if uploads are critical
+# Ensure upload folder exists at startup
+try:
+    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+    print(f"Upload folder '{UPLOAD_FOLDER}' ensured.")
+except OSError as e:
+    print(f"Error creating upload folder {UPLOAD_FOLDER}: {e}")
+    # Consider exiting if the folder is critical and cannot be created
 
 
 # --- Helper Functions ---
-def allowed_file(filename):
+def allowed_file(filename: str):
     """Checks if the file extension is allowed."""
     return '.' in filename and \
            filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-# --- Core Processing Function ---
-def process_uploaded_file(file_storage, original_filename):
+# --- API Key Dependency ---
+async def verify_api_key(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
+    """Dependency function to verify the provided API key via the X-API-Key header."""
+    if not API_SECRET_KEY:
+        print("CRITICAL SERVER ERROR: API_SECRET_KEY is not configured.")
+        # Do not expose internal state; raise a standard server error for the client.
+        raise HTTPException(status_code=503, detail="Service Unavailable: API Key configuration error.")
+    if not x_api_key or x_api_key != API_SECRET_KEY:
+        print(f"API Authentication Failed. Provided Key: {'Present but Invalid' if x_api_key else 'Missing'}")
+        raise HTTPException(status_code=401, detail="Unauthorized: Missing or invalid API key.")
+    # If the key is valid, we don't need to return it, just let the request proceed.
+    # return x_api_key
+
+
+# --- Core Processing Function (Async Version) ---
+async def process_uploaded_file(file: UploadFile, original_filename: str) -> Dict[str, Any]:
     """
     Handles saving, preprocessing, OCR, and DB insertion for an uploaded file.
-    Encapsulates the core logic used by both UI and API routes.
+    Raises HTTPException on failure.
 
     Args:
-        file_storage (FileStorage): The file object from Flask request.files.
+        file (UploadFile): The file object from FastAPI.
         original_filename (str): The original filename provided by the user (already secured).
 
     Returns:
-        tuple: (result_dict, status_code)
-               result_dict contains success/error info.
-               status_code is the suggested HTTP status.
+        dict: Dictionary containing success data {"status": "success", "data": ..., "record_id": ...}.
+
+    Raises:
+        HTTPException: On any processing error (file type, conversion, OCR, DB).
     """
     temp_filename = None
     temp_filepath = None
@@ -68,21 +93,26 @@ def process_uploaded_file(file_storage, original_filename):
     image_to_process_path = None
 
     try:
-        # Generate unique filename and path
+        # --- Prepare Filenames ---
         unique_id = uuid.uuid4().hex
-        # Ensure original_filename is safe before extracting extension
         safe_original_filename = secure_filename(original_filename)
         if not safe_original_filename or '.' not in safe_original_filename:
              print(f"Error: Invalid original filename after securing: {original_filename}")
-             return {"status": "error", "message": "Invalid or disallowed filename."}, 400
-
+             raise HTTPException(status_code=400, detail="Invalid or disallowed filename.")
         file_ext = safe_original_filename.rsplit('.', 1)[1].lower()
         temp_filename = f"{unique_id}.{file_ext}"
-        temp_filepath = os.path.join(app.config['UPLOAD_FOLDER'], temp_filename)
+        temp_filepath = os.path.join(UPLOAD_FOLDER, temp_filename)
 
-        # --- 1. Save Uploaded File Temporarily ---
-        file_storage.save(temp_filepath)
-        print(f"File temporarily saved to: {temp_filepath}")
+        # --- 1. Save Uploaded File ---
+        try:
+            with open(temp_filepath, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+            print(f"File temporarily saved to: {temp_filepath}")
+        except Exception as save_err:
+             print(f"Error saving uploaded file: {save_err}")
+             raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {save_err}")
+        finally:
+            await file.close()
 
         # --- 2. File Preprocessing (PDF to Image) ---
         if is_image_file(temp_filename):
@@ -90,24 +120,26 @@ def process_uploaded_file(file_storage, original_filename):
             print("Processing as image file.")
         elif is_pdf_file(temp_filename):
             print("Processing as PDF file. Attempting conversion to image...")
-            generated_image_path = convert_pdf_to_image(temp_filepath, app.config['UPLOAD_FOLDER'])
+            # Note: convert_pdf_to_image is synchronous. If performance becomes an issue
+            # for large PDFs, consider running it in a separate thread or process pool
+            # using something like `run_in_threadpool` from `starlette.concurrency`.
+            generated_image_path = convert_pdf_to_image(temp_filepath, UPLOAD_FOLDER)
             if generated_image_path:
                 image_to_process_path = generated_image_path
                 print(f"PDF converted to image: {generated_image_path}")
             else:
                 print("Error: Failed to convert PDF to image.")
-                return {"status": "error", "message": "Failed to convert PDF to image for processing."}, 400 # Bad Request
+                raise HTTPException(status_code=400, detail="Failed to convert PDF to image for processing.")
         else:
-             # This case should not be reached due to prior allowed_file check
              print("Error: Unsupported file type after save (internal error).")
-             return {"status": "error", "message": "Unsupported file type."}, 400 # Bad Request
+             raise HTTPException(status_code=400, detail="Unsupported file type.")
 
-
-        # --- 3. OCR Processing (if image available) ---
+        # --- 3. OCR Processing ---
         if image_to_process_path:
             print(f"Starting OCR processing for: {image_to_process_path}")
             start_time = time.time()
-            # Call Gemini AI for extraction
+            # Note: extract_data_with_gemini is synchronous (likely involves network I/O).
+            # For high concurrency, consider running in a thread pool.
             extracted_data = extract_data_with_gemini(image_to_process_path)
             end_time = time.time()
             processing_duration = round(end_time - start_time, 2)
@@ -115,79 +147,72 @@ def process_uploaded_file(file_storage, original_filename):
 
             # --- 4. Handle OCR Results ---
             if extracted_data and 'error' not in extracted_data:
-                # Successful extraction from Gemini
-                # Add metadata before saving to DB
                 extracted_data['_metadata'] = {
-                    'original_filename': safe_original_filename, # Use the secured filename
-                    'upload_timestamp': datetime.datetime.utcnow().isoformat() + 'Z', # ISO 8601 format UTC
+                    'original_filename': safe_original_filename,
+                    'upload_timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
                     'processing_time_seconds': processing_duration,
-                    'processed_file': os.path.basename(image_to_process_path) # The actual image file used by OCR
+                    'processed_file': os.path.basename(image_to_process_path)
                 }
 
                 # --- 5. Store in MongoDB ---
                 print("Attempting to insert extracted data into MongoDB...")
-                # CRITICAL NOTE: insert_one MUTATES the original extracted_data dict
-                # by adding the '_id' field (containing an ObjectId) upon success.
+                # Note: insert_record is synchronous.
                 record_id = db_handler.insert_record(extracted_data)
 
                 if record_id:
-                    # Successfully inserted
                     str_record_id = str(record_id)
                     print(f"Successfully inserted. Record ID (str): {str_record_id}")
-                    # Remove the ObjectId (_id) before returning the data payload
-                    extracted_data.pop('_id', None)
-                    return {"status": "success", "data": extracted_data, "record_id": str_record_id}, 200 # OK
+                    extracted_data.pop('_id', None) # Remove ObjectId before returning
+                    return {"status": "success", "data": extracted_data, "record_id": str_record_id} # Return success dict
                 else:
-                    # DB Insert failed
                     print("Error: Failed to store data in MongoDB.")
-                    # Remove potentially added _id before returning preview
                     extracted_data.pop('_id', None)
-                    # Return extracted data even on DB error for API context, but flag error
-                    return {"status": "error", "message": "File processed, but failed to store data in MongoDB.", "extracted_data_preview": extracted_data}, 500 # Internal Server Error
+                    raise HTTPException(status_code=500, detail="File processed, but failed to store data in MongoDB.")
             else:
-                # Handle errors reported by Gemini or OCR processing failure
+                # Handle errors reported by Gemini
                 error_message = "Unknown error during OCR processing."
                 raw_response = None
                 if extracted_data and 'error' in extracted_data:
                      error_message = extracted_data.get('error')
-                     raw_response = extracted_data.get('raw_response') # Pass raw response if available
+                     raw_response = extracted_data.get('raw_response')
                 elif extracted_data is None:
                      error_message = "OCR processing function returned None."
 
                 print(f"OCR processing failed: {error_message}")
-                result = {"status": "error", "message": f"OCR processing failed: {error_message}"}
+                detail = f"OCR processing failed: {error_message}"
                 if raw_response:
-                    result["raw_api_response"] = raw_response # Include raw response in API error if available
-                # Determine appropriate status code for AI errors
-                status_code = 502 if "API Error" in error_message or "API policy" in error_message or "blocked" in error_message.lower() else 500
-                return result, status_code
-        else:
-             # This case might occur if PDF conversion failed and returned None
-             print("Error: No processable image was available after preprocessing step.")
-             return {"status": "error", "message": "Could not obtain a processable image from the file."}, 500 # Internal Server Error
+                    # Avoid sending potentially huge raw responses in error detail
+                    detail += f" | Raw Response Snippet: {str(raw_response)[:200]}..."
 
-    # --- 6. Global Exception Handling within processing ---
+                status_code = 502 if "API Error" in error_message or "API policy" in error_message or "blocked" in error_message.lower() else 500
+                raise HTTPException(status_code=status_code, detail=detail)
+        else:
+             print("Error: No processable image was available after preprocessing step.")
+             raise HTTPException(status_code=500, detail="Could not obtain a processable image from the file.")
+
+    # --- 6. Exception Handling ---
+    except HTTPException as http_exc:
+         # Re-raise HTTPExceptions to be handled by FastAPI's default handler
+         raise http_exc
     except Exception as e:
-        # Catch any unexpected errors during the core file processing steps
+        # Catch any other unexpected errors during processing
         error_type = type(e).__name__
         error_msg = str(e)
         print(f"ERROR: An unexpected error occurred during file processing ({error_type}): {error_msg}")
-        traceback.print_exc() # Log the full traceback
-        return {"status": "error", "message": f"An unexpected server error occurred during processing ({error_type})."}, 500 # Internal Server Error
+        traceback.print_exc()
+        # Raise as an HTTPException so FastAPI returns a proper JSON error response
+        raise HTTPException(status_code=500, detail=f"An unexpected server error occurred ({error_type}).")
 
     # --- 7. Cleanup ---
     finally:
-        # This block executes whether the try block succeeded or failed
+        # This block executes regardless of success or failure
         print("Cleaning up temporary files...")
-        # Clean up the original temporary uploaded file
         if temp_filepath and os.path.exists(temp_filepath):
             try:
                 os.remove(temp_filepath)
                 print(f"Removed temporary upload: {temp_filepath}")
             except OSError as e:
                 print(f"Error removing temporary file {temp_filepath}: {e}")
-
-        # Clean up the generated image ONLY if it was created and is different from the temp upload
         if generated_image_path and generated_image_path != temp_filepath and os.path.exists(generated_image_path):
             try:
                 os.remove(generated_image_path)
@@ -196,148 +221,92 @@ def process_uploaded_file(file_storage, original_filename):
                 print(f"Error removing generated image {generated_image_path}: {e}")
 
 
-# --- Web UI Routes ---
-@app.route('/', methods=['GET'])
-def index():
-    """Renders the main upload page (UI)."""
-    current_db_error = db_handler.connection_error
-    if current_db_error:
-         flash(f"Warning: Database connection issue - {current_db_error}", 'error')
-    else:
-         flash("Database connection appears okay.", 'info')
-    return render_template('index.html')
-
-@app.route('/upload', methods=['POST'])
-def upload_file_ui():
-    """Handles file uploads from the HTML form (UI)."""
-    # Basic file checks for UI route
-    if 'file' not in request.files:
-        flash('No file part in the request.', 'error')
-        return redirect(request.url) # Redirect back to index
-
-    file = request.files['file']
+# --- API Endpoint Definition ---
+@app.post(
+    "/api/v1/extract", # URL Path
+    status_code=200,    # Default status code on success
+    summary="Upload Document for OCR Extraction",
+    description="Upload an image (PNG, JPG, JPEG) or PDF file. The API processes the file "
+                "using Google Gemini Vision, extracts structured data based on internal prompting, "
+                "stores the result in MongoDB, and returns the extracted data and the database record ID.",
+    tags=["OCR Extraction"] # Tag for grouping in API docs
+)
+async def extract_api(
+    # Use Depends for API Key verification. It will raise HTTPException if invalid.
+    api_key_verified: None = Depends(verify_api_key),
+    # Define the file upload parameter. FastAPI handles multipart/form-data.
+    file: UploadFile = File(..., description="The document file (image or PDF) to process.")
+):
+    """
+    Main API endpoint. Requires API key authentication. Accepts a file upload,
+    processes it, and returns the extracted JSON data or an error.
+    """
+    # 1. Basic File Validation (Filename check, Allowed Type)
     filename = file.filename
-
-    if filename == '':
-        flash('No file selected.', 'error')
-        return redirect(request.url)
-
+    if not filename:
+        raise HTTPException(status_code=400, detail="No file selected or filename missing.")
     if not allowed_file(filename):
-        flash(f"File type not allowed. Allowed: {', '.join(ALLOWED_EXTENSIONS)}.", 'error')
-        return redirect(request.url)
+        raise HTTPException(status_code=400, detail=f"File type '{filename.rsplit('.', 1)[-1]}' not allowed. Allowed types: {', '.join(ALLOWED_EXTENSIONS)}.")
 
-    # Secure the filename before passing it to the processing function
+    # 2. Secure the filename
     safe_filename = secure_filename(filename)
     if not safe_filename:
-        flash('Invalid filename provided.', 'error')
-        return redirect(request.url)
+        raise HTTPException(status_code=400, detail="Invalid or disallowed filename.")
 
-    # Call the core processing function
-    result_data, status_code = process_uploaded_file(file, safe_filename)
+    # 3. Call the core processing function
+    # It will return the success dictionary or raise an HTTPException
+    result_data = await process_uploaded_file(file, safe_filename)
 
-    # Handle result specifically for the UI
-    if status_code == 200 and result_data.get("status") == "success":
-        # Success case: Render the report page
-        flash('File processed and data stored successfully!', 'success')
-        return render_template('report.html',
-                               data=result_data.get("data"),
-                               record_id=result_data.get("record_id"))
-    else:
-        # Error case: Flash the error message and redirect to index
-        error_message = result_data.get("message", "An unknown error occurred during processing.")
-        flash(f'Processing failed: {error_message}', 'error')
-        # Optionally: Log more details from result_data if needed
-        # print(f"UI Upload Error Details: {result_data}")
-        return redirect(url_for('index')) # Redirect to index page on any processing error
+    # 4. Return successful result (FastAPI automatically converts dict to JSON)
+    return result_data
 
 
-# --- API Endpoint ---
-@app.route('/api/v1/extract', methods=['POST'])
-def extract_api():
-    """API endpoint for programmatic file extraction."""
-    # 1. Check API Key Authentication
-    provided_key = request.headers.get('X-API-Key')
-    if not API_SECRET_KEY:
-        # Log this misconfiguration but return a standard error to client
-        print("CRITICAL ERROR: API_SECRET_KEY is not configured on the server.")
-        return jsonify({"status": "error", "message": "API endpoint not configured correctly."}), 503 # Service Unavailable
-    if not provided_key or provided_key != API_SECRET_KEY:
-        print(f"API Auth Failed. Provided Key: {'Present but Invalid' if provided_key else 'Missing'}")
-        # Use 401 for missing/bad credentials
-        return jsonify({"status": "error", "message": "Unauthorized: Missing or invalid API key."}), 401
+# --- Optional Root Endpoint for Health Check / Info ---
+@app.get("/", tags=["Status"], summary="API Status")
+async def read_root():
+    """Basic status endpoint to check if the API is running."""
+    # Could add DB connection check here if desired
+    # status = "OK" if not db_handler.connection_error else "Error: DB Connection Issue"
+    status = "OK"
+    return {"api_status": status, "version": app.version}
 
-    # 2. Check for file part in the multipart request
-    if 'file' not in request.files:
-        return jsonify({"status": "error", "message": "No 'file' part found in the multipart request."}), 400
-
-    file = request.files['file']
-    filename = file.filename
-
-    # 3. Check if file is selected (has a filename)
-    if not filename: # Check if filename is empty or None
-        return jsonify({"status": "error", "message": "No file selected or filename missing."}), 400
-
-    # 4. Check allowed file type
-    if not allowed_file(filename):
-        return jsonify({"status": "error", "message": f"File type not allowed. Allowed types: {', '.join(ALLOWED_EXTENSIONS)}."}), 400
-
-    # 5. Secure the filename
-    safe_filename = secure_filename(filename)
-    if not safe_filename:
-        return jsonify({"status": "error", "message": "Invalid or disallowed filename."}), 400
-
-    # 6. Call the core processing function
-    result_data, status_code = process_uploaded_file(file, safe_filename)
-
-    # 7. Return JSON response from the processing function
-    return jsonify(result_data), status_code
+# --- Global Exception Handler (Optional but Recommended) ---
+# This catches any Exception not already handled as an HTTPException
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    """Handles any unexpected errors not caught elsewhere, returning a JSON response."""
+    error_type = type(exc).__name__
+    print(f"ERROR: Global exception handler caught unhandled error ({error_type}) for request {request.url}: {exc}")
+    traceback.print_exc()
+    # Return a generic server error response
+    return JSONResponse(
+        status_code=500,
+        content={"status": "error", "message": f"An internal server error occurred: {error_type}"},
+    )
 
 
-# --- Optional Static File Route (for debugging uploads) ---
-# Use with caution in production, Nginx should handle static files.
-@app.route('/uploads/<path:filename>') # Use path converter for flexibility
-def uploaded_file(filename):
-    """Serves files from the upload folder. USE WITH CAUTION."""
-    # Prevent directory traversal attacks
-    safe_dir = os.path.abspath(app.config['UPLOAD_FOLDER'])
-    safe_path = os.path.abspath(os.path.join(safe_dir, filename))
-    if not safe_path.startswith(safe_dir):
-        print(f"Attempted directory traversal: {filename}")
-        return "Forbidden", 403
-
-    if not os.path.exists(safe_path) or not os.path.isfile(safe_path):
-        return "File not found", 404
-
-    print(f"Serving file from upload dir: {filename}") # Log access
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
-
-
-# --- Application Startup ---
-if __name__ == '__main__':
-    # Check initial DB connection status
-    if db_connection_error:
+# --- Application Startup Logic ---
+# This block is mainly for running the app directly using `python app.py` for local development.
+# When run via Gunicorn in Docker, Gunicorn handles the execution based on the CMD.
+if __name__ == "__main__":
+    # Perform startup checks (optional but helpful)
+    if db_handler.connection_error:
          print(f"\n{'='*20} WARNING {'='*20}")
-         print(f"Initial MongoDB connection failed: {db_connection_error}")
-         print("The application will run, but database operations will likely fail.")
-         print("Please check your .env file and MongoDB server status.")
+         print(f"Initial MongoDB connection failed: {db_handler.connection_error}")
+         print("Database operations will likely fail.")
          print(f"{'='*50}\n")
     else:
          print("Initial MongoDB connection check successful.")
 
-    # Check if API key is configured for the API endpoint
     if not API_SECRET_KEY:
         print(f"\n{'='*20} WARNING {'='*20}")
         print("API_SECRET_KEY is not set in the environment variables (.env).")
-        print("The API endpoint '/api/v1/extract' requires this for authentication and will be inaccessible.")
+        print("The API endpoint '/api/v1/extract' will be inaccessible without a valid key.")
         print(f"{'='*50}\n")
 
-    # Determine debug mode from environment variable
-    is_debug_mode = os.environ.get('FLASK_DEBUG', 'True').lower() in ['true', '1', 'yes']
-    print(f"Starting Flask app (Debug mode: {is_debug_mode})...")
-
-    # Run the Flask development server OR use Gunicorn if running via Docker CMD
-    # The host='0.0.0.0' makes it accessible externally (within Docker network or from host)
-    # The port is typically 5000 for Flask dev server or Gunicorn binding
-    # Note: If running with `python app.py`, this runs the dev server.
-    # If running via `gunicorn app:app`, Gunicorn handles the execution.
-    app.run(debug=is_debug_mode, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    # Use Uvicorn for local development when running `python app.py`
+    import uvicorn
+    print("Starting FastAPI app with Uvicorn development server...")
+    # `reload=True` automatically restarts the server when code changes.
+    # Use port 8000 as standard for FastAPI/Uvicorn development.
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)

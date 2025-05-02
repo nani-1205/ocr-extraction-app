@@ -4,7 +4,7 @@
 version: '3.3'
 
 services:
-  # The Flask Application Service
+  # The FastAPI Application Service
   # Compose will automatically create unique container names for scaled instances
   # e.g., projectname_app_1, projectname_app_2, etc.
   app:
@@ -12,7 +12,7 @@ services:
       context: .          # Directory containing Dockerfile.app and application code
       dockerfile: Dockerfile.app # Specify the Dockerfile for the app
     # Optionally specify image name for registry push/pull:
-    # image: your-dockerhub-username/ocr-app:latest
+    # image: your-dockerhub-username/ocr-api:fastapi-latest
     # restart: unless-stopped # Optional: Restart policy for the containers
     env_file:
       - .env            # Load environment variables from the .env file
@@ -24,14 +24,7 @@ services:
 
     # IMPORTANT FOR MONGODB ACCESS:
     # Ensure MONGO_HOST in your .env file is reachable from the Docker container.
-    # - If MongoDB runs on your HOST machine (Docker Desktop): Use "host.docker.internal"
-    #   Example .env: MONGO_HOST="host.docker.internal"
-    # - If MongoDB runs on your HOST machine (Linux): Use the Docker bridge IP (e.g., 172.17.0.1)
-    #   Example .env: MONGO_HOST="172.17.0.1" (Find yours via `ip addr show docker0`)
-    # - If MongoDB is ALSO a Docker container in this compose file (not shown here): Use its service name.
-    #   Example .env: MONGO_HOST="mongodb_service_name"
-    # - If MongoDB is external (like your 18.60.111.115): Use the external IP.
-    #   Example .env: MONGO_HOST="18.60.111.115" (Ensure container network allows access)
+    # See comments in previous versions or the .env example for details.
 
     # NOTE: The 'deploy' key with 'replicas' is removed as it's not supported
     # by Compose file version 3.3. Use `--scale app=N` on the command line.
@@ -40,11 +33,11 @@ services:
   # Acts as the single entry point and distributes requests to 'app' instances.
   nginx:
     image: nginx:1.25-alpine # Use a specific, stable version of the official Nginx image
-    container_name: ocr_nginx_lb # Custom name is okay for this single instance service
+    container_name: ocr_api_nginx_lb # Custom name is okay for this single instance service
     # restart: unless-stopped # Optional: Restart policy
     ports:
       - "5000:80"       # Map HOST Port 5000 -> Nginx Container Port 80
-                        # Access the clustered app via http://<your-host-ip>:5000
+                        # Access the clustered API via http://<your-host-ip>:5000
     volumes:
       # Mount the custom Nginx configuration file into the container (read-only)
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
@@ -52,7 +45,6 @@ services:
       - ocr_network     # Connect Nginx to the same network as the app services
     depends_on:
       - app             # Ensures 'app' service(s) are started before Nginx
-                        # Note: Doesn't guarantee app readiness, only startup order.
 
 # Define the custom network for services to communicate
 networks:
